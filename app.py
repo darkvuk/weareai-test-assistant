@@ -63,6 +63,7 @@ class EventHandler(AssistantEventHandler):
         st.session_state.current_message = ""
         with st.chat_message("Assistant"):
             st.session_state.current_markdown = st.empty()
+        # print("Text created:", text)  # Print text created event
 
     @override
     def on_text_delta(self, delta, snapshot):
@@ -74,12 +75,14 @@ class EventHandler(AssistantEventHandler):
             st.session_state.current_markdown.markdown(
                 st.session_state.current_message, True
             )
+        # print("Text delta:", delta, snapshot)  # Print text delta event
 
     @override
     def on_text_done(self, text):
         format_text = format_annotation(text)
         st.session_state.current_markdown.markdown(format_text, True)
         st.session_state.chat_log.append({"name": "assistant", "msg": format_text})
+        print("Text done:", text)  # Print text done event
 
     @override
     def on_tool_call_created(self, tool_call):
@@ -104,6 +107,7 @@ class EventHandler(AssistantEventHandler):
                 for output in delta.code_interpreter.outputs:
                     if output.type == "logs":
                         pass
+        # print("Tool call delta:", delta, snapshot)  # Print tool call delta event
 
     @override
     def on_tool_call_done(self, tool_call):
