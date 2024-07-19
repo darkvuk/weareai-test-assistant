@@ -13,7 +13,6 @@ import streamlit_authenticator as stauth
 
 load_dotenv()
 
-
 def str_to_bool(str_input):
     if not isinstance(str_input, str):
         return False
@@ -29,6 +28,7 @@ enabled_file_upload_message = os.environ.get(
 azure_openai_endpoint = os.environ.get("AZURE_OPENAI_ENDPOINT")
 azure_openai_key = os.environ.get("AZURE_OPENAI_KEY")
 authentication_required = str_to_bool(os.environ.get("AUTHENTICATION_REQUIRED", False))
+
 
 # Load authentication configuration
 if authentication_required:
@@ -82,7 +82,7 @@ class EventHandler(AssistantEventHandler):
         format_text = format_annotation(text)
         st.session_state.current_markdown.markdown(format_text, True)
         st.session_state.chat_log.append({"name": "assistant", "msg": format_text})
-        print("Text done:", text)  # Print text done event
+        # print("Text done:", text)  # Print text done event
 
     @override
     def on_tool_call_created(self, tool_call):
@@ -151,29 +151,46 @@ class EventHandler(AssistantEventHandler):
                         "output": tool_function_output,
                     }
                 )
-
-            with client.beta.threads.runs.submit_tool_outputs_stream(
-                thread_id=st.session_state.thread.id,
-                run_id=self.current_run.id,
-                tool_outputs=tool_outputs,
-                event_handler=EventHandler(),
-            ) as stream:
-                stream.until_done()
+            thread_id = st.session_state.get("previous_thread_id", "")
+            if thread_id == '':
+                with client.beta.threads.runs.submit_tool_outputs_stream(
+                    thread_id=st.session_state.thread.id,
+                    run_id=self.current_run.id,
+                    tool_outputs=tool_outputs,
+                    event_handler=EventHandler(),
+                ) as stream:
+                    stream.until_done()
+            else:
+                with client.beta.threads.runs.submit_tool_outputs_stream(
+                    thread_id=thread_id,
+                    run_id=self.current_run.id,
+                    tool_outputs=tool_outputs,
+                    event_handler=EventHandler(),
+                ) as stream:
+                    stream.until_done()
 
 
 def create_thread(content, file):
+    st.session_state.previous_thread_submitted = True
     return client.beta.threads.create()
 
 
-def create_message(thread, content, file):
+def create_message(content, file, thread=None):
     attachments = []
     if file is not None:
         attachments.append(
             {"file_id": file.id, "tools": [{"type": "code_interpreter"}, {"type": "file_search"}]}
         )
-    client.beta.threads.messages.create(
-        thread_id=thread.id, role="user", content=content, attachments=attachments
-    )
+
+    thread_id = st.session_state.get("previous_thread_id", "")
+    if thread_id == '':
+        client.beta.threads.messages.create(
+            thread_id=st.session_state.thread.id, role="user", content=content, attachments=attachments
+        )
+    else:
+        client.beta.threads.messages.create(
+            thread_id=thread_id, role="user", content=content, attachments=attachments
+        )
 
 
 def create_file_link(file_name, file_id):
@@ -187,17 +204,28 @@ def create_file_link(file_name, file_id):
 def format_annotation(text):
     return text.value
 
-
 def run_stream(user_input, file, selected_assistant_id):
-    if "thread" not in st.session_state:
+    if "thread" not in st.session_state and "previous_thread_id" not in st.session_state:
         st.session_state.thread = create_thread(user_input, file)
-    create_message(st.session_state.thread, user_input, file)
-    with client.beta.threads.runs.stream(
-        thread_id=st.session_state.thread.id,
-        assistant_id=selected_assistant_id,
-        event_handler=EventHandler(),
-    ) as stream:
-        stream.until_done()
+        create_message(user_input, file, st.session_state.thread)
+    else:
+        create_message(user_input, file)
+    
+    thread_id = st.session_state.get("previous_thread_id", "")
+    if thread_id == '':
+        with client.beta.threads.runs.stream(
+            thread_id=st.session_state.thread.id,
+            assistant_id=selected_assistant_id,
+            event_handler=EventHandler(),
+        ) as stream:
+            stream.until_done()
+    else:
+        with client.beta.threads.runs.stream(
+            thread_id=thread_id,
+            assistant_id=selected_assistant_id,
+            event_handler=EventHandler(),
+        ) as stream:
+            stream.until_done()
 
 
 def handle_uploaded_file(uploaded_file):
@@ -220,10 +248,17 @@ if "chat_log" not in st.session_state:
 if "in_progress" not in st.session_state:
     st.session_state.in_progress = False
 
+if "input_disabled" not in st.session_state:
+    st.session_state.input_disabled = False
 
 def disable_form():
     st.session_state.in_progress = True
+    st.session_state.input_disabled = True
 
+def enable_form():
+    st.session_state.in_progress = False
+    st.session_state.input_disabled = False
+    
 
 def login():
     if st.session_state["authentication_status"] is False:
@@ -235,6 +270,27 @@ def login():
 def reset_chat():
     st.session_state.chat_log = []
     st.session_state.in_progress = False
+    st.session_state.input_disabled = False
+
+
+def change_active_thread(previous_thread):
+    st.session_state.previous_thread_id = previous_thread
+
+    # Clear the current chat log before loading the previous thread messages
+    st.session_state.chat_log = []
+
+    thread_messages = client.beta.threads.messages.list(thread_id=previous_thread)
+    for message in reversed(thread_messages.data):
+        for content in message.content:
+            if content.type == 'text':
+                st.session_state.chat_log.append({"name": message.role, "msg": content.text.value})
+
+
+if "previous_thread_submitted" not in st.session_state:
+    st.session_state.previous_thread_submitted = False
+
+def on_submit():
+    st.session_state.previous_thread_submitted = True
 
 
 def load_chat_screen(assistant_id, assistant_title):
@@ -259,9 +315,27 @@ def load_chat_screen(assistant_id, assistant_title):
         uploaded_file = None
 
     st.title(assistant_title if assistant_title else "")
-    user_msg = st.chat_input(
-        "Message", on_submit=disable_form, disabled=st.session_state.in_progress
+    # Use the session state to disable the text input after submission
+    previous_thread = st.text_input(
+        "If you want to continue a previous chat, please paste the thread ID below.",
+        disabled=st.session_state.previous_thread_submitted,
+        on_change=on_submit,
+        key="previous_thread_input",
     )
+
+    if previous_thread and not st.session_state.previous_thread_submitted:
+        # Process the previous thread ID here
+        st.session_state.previous_thread_submitted = True
+        st.session_state.previous_thread_id = previous_thread
+        change_active_thread(previous_thread)
+
+    if previous_thread:
+        change_active_thread(previous_thread)
+
+    user_msg = st.chat_input(
+        "Message", on_submit=disable_form, disabled=st.session_state.input_disabled
+    )
+
     if user_msg:
         render_chat()
         with st.chat_message("user"):
@@ -272,8 +346,7 @@ def load_chat_screen(assistant_id, assistant_title):
         if uploaded_file is not None:
             file = handle_uploaded_file(uploaded_file)
         run_stream(user_msg, file, assistant_id)
-        st.session_state.in_progress = False
-        st.session_state.tool_call = None
+        enable_form()
         st.rerun()
 
     render_chat()
@@ -301,7 +374,7 @@ def main():
         assistants_json = json.loads(multi_agents)
         assistants_object = {f'{obj["title"]}': obj for obj in assistants_json}
         selected_assistant = st.sidebar.selectbox(
-            "Select an assistant profile?",
+            "Select an assistant profile",
             list(assistants_object.keys()),
             index=None,
             placeholder="Select an assistant profile...",
